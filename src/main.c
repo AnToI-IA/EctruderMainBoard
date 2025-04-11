@@ -13,9 +13,10 @@ typedef struct {
     uint32_t start_speed;     // Начальная скорость (Гц)
     uint32_t acceleration;    // Ускорение (Гц/сек)
     uint32_t min_speed;       // Минимальная скорость (Гц)
+    uint8_t update_pwm;       // Флаг обновления PWM
 } MotorParams;
 
-MotorParams motor_x = {0, 100, 100, 50, 50}; // Двигатель X
+MotorParams motor_x = {0, 100, 100, 100, 50}; // Двигатель X
 MotorParams motor_y = {0, 500, 200, 50, 50};  // Двигатель Y
 MotorParams motor_z = {0, 1500, 800, 200, 50}; // Двигатель Z
 
@@ -27,6 +28,8 @@ static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_USART2_UART_Init(void);
 void UpdateMotorSpeed(MotorParams *motor, TIM_HandleTypeDef *htim, uint32_t channel);
+void HAL_TIM_PWM_PulseFinishedCallback (TIM_HandleTypeDef *htim);
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim);
 
 /* Main program --------------------------------------------------------------*/
 int main(void)
@@ -39,8 +42,12 @@ int main(void)
     MX_TIM3_Init();
     MX_USART2_UART_Init();
 
+    // Запуск таймера с прерываниями
+    HAL_TIM_OC_Start_IT(&htim1, TIM_CHANNEL_3); // Прерывание по совпадению
+    HAL_TIM_Base_Start_IT(&htim1);             // Прерывание по переполнению
+
     // Запуск PWM для всех двигателей
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3); // Двигатель X
+    HAL_TIM_PWM_Start_IT(&htim1, TIM_CHANNEL_3); // Двигатель X
     HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2); // Двигатель Y
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2); // Двигатель Z
 
@@ -56,17 +63,21 @@ int main(void)
 
     // Установка выхода DIR_EN в HIGH (включение драйвера)
     HAL_GPIO_WritePin(GPIOA, EN__Pin, GPIO_PIN_SET); // EN (включение драйвера)
-
+    // Включим флаг обновления PWM
+    motor_x.update_pwm = 1;
     while (1)
-    {
-        // Обновление скоростей двигателей
+    {          
         UpdateMotorSpeed(&motor_x, &htim1, TIM_CHANNEL_3);
+        __HAL_TIM_DISABLE_IT(&htim1, TIM_IT_UPDATE);
+        __HAL_TIM_DISABLE_IT(&htim1, TIM_IT_CC1);
+        // Обновление скоростей двигателей Y и Z
         UpdateMotorSpeed(&motor_y, &htim2, TIM_CHANNEL_2);
         UpdateMotorSpeed(&motor_z, &htim3, TIM_CHANNEL_2);
-
+        motor_x.update_pwm = 0; // Сброс флага обновления PWM
         // Проверка кнопки B1
         if (HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) == GPIO_PIN_RESET) // Кнопка нажата
         {
+            motor_x.update_pwm = 1;
             uint32_t press_start = HAL_GetTick(); // Запоминаем время начала нажатия
             HAL_Delay(25); // Антидребезг
 
@@ -94,6 +105,9 @@ int main(void)
                     motor_x.target_speed = motor_x.start_speed;
                     while (motor_x.current_speed < motor_x.target_speed)
                     {
+                        __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
+                        __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_CC1);
+                        motor_x.update_pwm = 1;
                         UpdateMotorSpeed(&motor_x, &htim1, TIM_CHANNEL_3);
                         HAL_Delay(10); // Задержка для плавного разгона
                     }
@@ -106,6 +120,7 @@ int main(void)
 
             if (HAL_GetTick() - press_start <= 500) // Короткое нажатие
             {
+                motor_x.update_pwm = 1;
                 // Увеличение скорости двигателя X
                 motor_x.target_speed += 250;
                 if (motor_x.target_speed > 100000) // Ограничение до 100 кГц
@@ -114,10 +129,8 @@ int main(void)
                 }
 
                 // Переключение светодиода LD2
-                HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
             }
         }
-
         HAL_Delay(5); // Задержка для плавного изменения скорости
     }
 }
@@ -125,6 +138,12 @@ int main(void)
 /* Функция обновления скорости двигателя */
 void UpdateMotorSpeed(MotorParams *motor, TIM_HandleTypeDef *htim, uint32_t channel)
 {
+    if (motor->update_pwm == 0) 
+    {
+        __HAL_TIM_DISABLE_IT(htim, TIM_IT_UPDATE);
+        __HAL_TIM_DISABLE_IT(htim, TIM_IT_CC3);
+        return; // Если обновление PWM отключено
+    }
     if (motor->current_speed < motor->target_speed)
     {
         // Увеличение текущей скорости с учетом ускорения
@@ -149,16 +168,18 @@ void UpdateMotorSpeed(MotorParams *motor, TIM_HandleTypeDef *htim, uint32_t chan
     // Обновление периода таймера для изменения частоты
     if (motor->current_speed > 0)
     {
-        uint32_t period = 1000000 / motor->current_speed; // Период в микросекундах
+        //uint32_t period = 1000000 / motor->current_speed; // Период в микросекундах
         
-        __HAL_TIM_SET_COMPARE(htim, channel, period / 2); // 50% PWM
-        __HAL_TIM_SET_AUTORELOAD(htim, period - 1);
+        //__HAL_TIM_SET_COMPARE(htim, channel, period / 2); // 50% PWM
+        //__HAL_TIM_SET_AUTORELOAD(htim, period - 1);
     }
     else
     {
         // Остановка двигателя
         __HAL_TIM_SET_COMPARE(htim, channel, 0);
     }
+    __HAL_TIM_ENABLE_IT(htim, TIM_IT_UPDATE);
+    __HAL_TIM_ENABLE_IT(htim, TIM_IT_CC3);
 }
 
 /* TIM1 Initialization Function (Двигатель X) */
@@ -182,6 +203,13 @@ static void MX_TIM1_Init(void)
     HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3);
 
     HAL_TIM_MspPostInit(&htim1);
+
+    /* Настройка NVIC для TIM1 */
+    HAL_NVIC_SetPriority(TIM1_UP_IRQn, 0, 0); // Прерывание по переполнению
+    HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
+
+    HAL_NVIC_SetPriority(TIM1_CC_IRQn, 0, 1); // Прерывание по совпадению
+    HAL_NVIC_EnableIRQ(TIM1_CC_IRQn);
 }
 
 /* TIM2 Initialization Function (Двигатель Y) */
@@ -326,4 +354,26 @@ void SystemClock_Config(void)
         while (1); // Обработка ошибки
     }
     __HAL_RCC_RTC_ENABLE();
+}
+
+/* Обработчик прерывания по совпадению (COMPARE) */
+void HAL_TIM_PWM_PulseFinishedCallback (TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM1 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_3)
+    {
+        // Изменение регистра AUTORELOAD
+        uint32_t new_period = 1000000 / motor_x.current_speed; // Новый период
+        __HAL_TIM_SET_AUTORELOAD(htim, new_period - 1);
+    }
+}
+
+/* Обработчик прерывания по переполнению (RELOAD) */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM1)
+    {
+        // Изменение регистра COMPARE
+        uint32_t compare_value = (__HAL_TIM_GET_AUTORELOAD(htim) + 1) / 2; // 50% PWM
+        __HAL_TIM_SET_COMPARE(htim, TIM_CHANNEL_3, compare_value);
+    }
 }
